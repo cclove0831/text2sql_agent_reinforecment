@@ -1,0 +1,4 @@
+interface:
+  display_name: "Text2SQL Plan"
+  short_description: "Text2SQL + GRPO workflow and guidelines"
+

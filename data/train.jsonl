@@ -1,0 +1,8 @@
+{"id":"tr001","question":"How many artists are there?","schema_path":"data/schema.txt","gt_sql":"SELECT COUNT(*) AS n FROM Artist;","gt_answer":"275"}
+{"id":"tr002","question":"List the first 5 artist names in alphabetical order.","schema_path":"data/schema.txt","gt_sql":"SELECT Name FROM Artist ORDER BY Name LIMIT 5;","gt_answer":"A Cor Do Som | AC/DC | Aaron Copland & London Symphony Orchestra | Aaron Goldberg | Academy of St. Martin in the Fields & Sir Neville Marriner"}
+{"id":"tr003","question":"How many albums are there in total?","schema_path":"data/schema.txt","gt_sql":"SELECT COUNT(*) AS n FROM Album;","gt_answer":"347"}
+{"id":"tr004","question":"Which artist has the most albums? Return the artist name and album count.","schema_path":"data/schema.txt","gt_sql":"SELECT ar.Name AS artist_name, COUNT(al.AlbumId) AS album_count FROM Artist ar JOIN Album al ON ar.ArtistId = al.ArtistId GROUP BY ar.ArtistId ORDER BY album_count DESC, artist_name ASC LIMIT 1;","gt_answer":"Iron Maiden, 21"}
+{"id":"tr005","question":"How many tracks are there in total?","schema_path":"data/schema.txt","gt_sql":"SELECT COUNT(*) AS n FROM Track;","gt_answer":"3503"}
+{"id":"tr006","question":"What is the average track length in milliseconds? Round to the nearest integer.","schema_path":"data/schema.txt","gt_sql":"SELECT ROUND(AVG(Milliseconds)) AS avg_ms FROM Track;","gt_answer":"393599"}
+{"id":"tr007","question":"How many customers are there?","schema_path":"data/schema.txt","gt_sql":"SELECT COUNT(*) AS n FROM Customer;","gt_answer":"59"}
+{"id":"tr008","question":"How many invoices are there?","schema_path":"data/schema.txt","gt_sql":"SELECT COUNT(*) AS n FROM Invoice;","gt_answer":"412"}
