@@ -1,3 +1,4 @@
+import os
 from typing import Any
 
 from openai import OpenAI
@@ -9,22 +10,39 @@ SYSTEM = """You are a Text-to-SQL agent for an SQLite database.
 
 You MUST follow a Thought/Action/Observation loop. On each turn, output exactly ONE action:
 
-- [SCHEMA]
-- [SQL] <a single SQLite SELECT query>
-- [ANSWER] <final answer>
+[SCHEMA]
+[SQL] <one SQLite SELECT/CTE query>
+[ANSWER] <final answer>
 
-Rules:
-- Always call [SCHEMA] first unless you already observed the schema.
-- Only use tables/columns that appear in the schema observation.
-- Only read-only queries (SELECT / WITH). No INSERT/UPDATE/DELETE/DROP/PRAGMA/VACUUM, etc.
+Formatting rules:
+- `[SCHEMA]` has NO argument. Output exactly `[SCHEMA]` and nothing else.
+- Any SQL statement MUST be under `[SQL]` (not under `[SCHEMA]`).
+- SQL may span multiple lines, but must be a single statement and must start with SELECT or WITH.
+- You may include an optional <think>...</think> block. Outside <think>, output only the action token plus its payload.
+
+Operational rules:
+- Step 1 MUST be [SCHEMA]. If you have not seen the schema in this conversation, do [SCHEMA] now.
+- Use ONLY tables/columns that appear in the schema observation. Never invent names.
+- Only read-only SQL: SELECT or WITH ... SELECT. No PRAGMA and no writes (INSERT/UPDATE/DELETE/DROP/ALTER/VACUUM).
+- Prefer explicit column lists; avoid SELECT * unless necessary for debugging.
 - If the Observation starts with "Error:", fix the SQL and try again.
-- When a SQL runs successfully, the Observation will include an `Answer:` line. When ready, output
-  `[ANSWER]` followed by that exact value (no extra words).
 
-Output format:
-- Your message may include an optional <think>...</think> block.
-- The action token ([SCHEMA]/[SQL]/[ANSWER]) must appear in your message.
-- Do not output explanations outside <think>.
+Value grounding rules (important):
+- If the question filters by a string value that may vary in spelling/language/casing (e.g., "France" vs a translated name),
+  first ground it by inspecting actual values, then use the exact value you observed, e.g.:
+  - [SQL] SELECT DISTINCT <col> FROM <table> LIMIT 20
+  - [SQL] SELECT <col> FROM <table> WHERE <col> LIKE '%keyword%' LIMIT 20
+- If your query returns empty unexpectedly, re-check joins and grounded values before answering.
+
+Common patterns:
+- Superlatives (most/highest/lowest/first/last): ORDER BY ... LIMIT 1.
+- Counting: COUNT(*) or COUNT(DISTINCT col) when asked for unique counts.
+- Unique lists: DISTINCT.
+- Use JOINs only when needed; join on foreign keys / id columns shown in the schema.
+
+Answering:
+- When a SQL runs successfully, the Observation includes an `Answer:` line computed from the first rows.
+- When ready, output `[ANSWER]` followed by that exact `Answer:` value (no extra words).
 """
 
 
@@ -55,6 +73,12 @@ def _parse_action(text: str) -> tuple[str, str]:
         return "sql", _strip_code_fences(payload)
 
     if "[SCHEMA]" in upper:
+        # Some models mistakenly output SQL after [SCHEMA]. Treat it as SQL for robustness.
+        idx = upper.rfind("[SCHEMA]")
+        after = t[idx + len("[SCHEMA]") :].strip()
+        maybe = _strip_code_fences(after)
+        if maybe.lower().lstrip().startswith(("select", "with")):
+            return "sql", maybe
         return "schema", ""
 
     # Fallbacks for slightly off-format outputs.
@@ -94,7 +118,13 @@ class Text2SQLAgent:
         temperature: Sampling temperature (0.0 for eval; higher for rollout).
         """
         self.model_name = model_name
-        self.client = OpenAI(api_key=api_key, base_url=base_url)
+        resolved_key = api_key or os.getenv("OPENAI_API_KEY") or os.getenv("DASHSCOPE_API_KEY") or os.getenv("QWEN_API_KEY")
+        if not resolved_key:
+            raise ValueError(
+                "Missing API key. Pass --api_key (or api_key=...) or set one of "
+                "OPENAI_API_KEY / DASHSCOPE_API_KEY / QWEN_API_KEY."
+            )
+        self.client = OpenAI(api_key=resolved_key, base_url=base_url)
         self.max_steps = max_steps
         self.temperature = temperature
 
