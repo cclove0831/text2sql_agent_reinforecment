@@ -76,12 +76,16 @@ def _apply_chat_template(
 ):
     # transformers chat models expose apply_chat_template; fall back to a simple format.
     if hasattr(tokenizer, "apply_chat_template") and getattr(tokenizer, "chat_template", None):
-        return tokenizer.apply_chat_template(
+        # Some newer transformers versions may return `tokenizers.Encoding` when `tokenize=True`.
+        # To keep the return type stable, always render to text first, then tokenize.
+        text = tokenizer.apply_chat_template(
             messages,
             add_generation_prompt=add_generation_prompt,
-            tokenize=return_tensors is not None,
-            return_tensors=return_tensors,
+            tokenize=False,
         )
+        if return_tensors is None:
+            return text
+        return tokenizer(text, return_tensors=return_tensors, add_special_tokens=False).input_ids
 
     text_lines: list[str] = []
     for m in messages:

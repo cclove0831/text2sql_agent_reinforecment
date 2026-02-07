@@ -105,12 +105,15 @@ def _apply_chat_template(
     tokenizer: Any, messages: list[dict[str, str]], *, add_generation_prompt: bool, return_tensors: str | None
 ):
     if hasattr(tokenizer, "apply_chat_template") and getattr(tokenizer, "chat_template", None):
-        return tokenizer.apply_chat_template(
+        # Keep output type stable across transformers versions by rendering to text first.
+        text = tokenizer.apply_chat_template(
             messages,
             add_generation_prompt=add_generation_prompt,
-            tokenize=return_tensors is not None,
-            return_tensors=return_tensors,
+            tokenize=False,
         )
+        if return_tensors is None:
+            return text
+        return tokenizer(text, return_tensors=return_tensors, add_special_tokens=False).input_ids
 
     text_lines: list[str] = []
     for m in messages:
