@@ -1,5 +1,6 @@
 import argparse
 import json
+import inspect
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -338,13 +339,20 @@ def main() -> None:
         seed=int(args.seed),
     )
 
-    trainer = Trainer(
-        model=model,
-        args=train_args,
-        train_dataset=dataset,
-        data_collator=collator,
-        tokenizer=tokenizer,
-    )
+    trainer_kwargs: dict[str, Any] = {
+        "model": model,
+        "args": train_args,
+        "train_dataset": dataset,
+        "data_collator": collator,
+    }
+    # transformers v5 removed the `tokenizer=` kwarg in favor of `processing_class=`.
+    trainer_sig = inspect.signature(Trainer.__init__)
+    if "tokenizer" in trainer_sig.parameters:
+        trainer_kwargs["tokenizer"] = tokenizer
+    elif "processing_class" in trainer_sig.parameters:
+        trainer_kwargs["processing_class"] = tokenizer
+
+    trainer = Trainer(**trainer_kwargs)
 
     trainer.train()
     trainer.save_model(str(output_dir))
