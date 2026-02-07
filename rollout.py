@@ -82,6 +82,7 @@ def main():
                     pred_sql=out.get("sql"),
                     gt_sql=ex.get("gt_sql") or "",
                     db_path=ex.get("db_path"),
+                    trace=trace,
                     trace_steps=len(trace),
                     max_compare_rows=max_compare_rows,
                 )
@@ -122,4 +123,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

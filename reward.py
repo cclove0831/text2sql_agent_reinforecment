@@ -224,21 +224,27 @@ def compute_reward(
     pred_sql: str | None,
     gt_sql: str,
     db_path: str | Path | None = None,
+    trace: list[dict[str, Any]] | None = None,
     trace_steps: int | None = None,
     max_compare_rows: int | None = None,
+    weight_exec: float = 0.65,
+    weight_trace: float = 0.35,
 ) -> tuple[float, dict[str, Any]]:
     """
-    Skill-inspired mixed reward (execution-based).
+    Skill-inspired mixed reward for multi-step agents.
 
-    - correctness: +1 if execution results match, else -1
-    - validity: +0.1 if pred SQL executes, else -0.5
-    - hallucination: -1 if error indicates missing table/column
-    - efficiency: -0.2 if pred JOIN count > gt JOIN count
-    - step penalty: -0.1 per extra step beyond minimal (schema+sql)
+    We compute:
+    - r_exec (hard): execution_match(pred_sql, gt_sql) -> +1 / -1
+    - r_trace (shaping): based on the agent trace (schema-first, invalid actions, repeated SQL failures, hallucinations, etc.)
+
+    Final reward:
+        total = weight_exec * r_exec + weight_trace * r_trace
     """
     pred_sql = (pred_sql or "").strip() or None
     join_pred = _join_count(pred_sql or "")
     join_gt = _join_count(gt_sql or "")
+    if trace_steps is None and trace is not None:
+        trace_steps = len(trace)
     extra_steps = 0 if trace_steps is None else max(0, int(trace_steps) - 2)
 
     detail: dict[str, Any] = {
@@ -246,59 +252,95 @@ def compute_reward(
         "join_gt": join_gt,
         "trace_steps": trace_steps,
         "max_compare_rows": max_compare_rows,
+        "weight_exec": weight_exec,
+        "weight_trace": weight_trace,
     }
 
+    # ---- r_exec (hard correctness) ----
     if not pred_sql:
-        correctness = -1.0
-        validity = -0.5
-        hallucination = 0.0
-        join_penalty = 0.0
-        step_penalty = -0.1 * extra_steps
-        total = correctness + validity + hallucination + join_penalty + step_penalty
-        detail.update(
-            {
-                "correctness": correctness,
-                "validity": validity,
-                "hallucination": hallucination,
-                "join_penalty": join_penalty,
-                "step_penalty": step_penalty,
-                "pred_error": "no_sql",
-                "execution_match": False,
-            }
-        )
-        return total, detail
+        r_exec = -1.0
+        exec_detail = {"execution_match": False, "pred_error": "no_sql"}
+    else:
+        match, match_detail = execution_match(pred_sql, gt_sql, db_path=db_path, max_rows=max_compare_rows)
+        r_exec = 1.0 if match else -1.0
+        exec_detail = {**match_detail, "execution_match": match}
 
-    pred_exec = exec_sql_signature(pred_sql, db_path=db_path, max_rows=max_compare_rows)
+    detail.update(exec_detail)
+
+    # ---- r_trace (shaping) ----
+    # Keep shaping in [-1, 1] and smaller than the hard reward.
+    schema_first = None
+    invalid_count = 0
+    sql_calls = 0
+    sql_ok_count = 0
+    sql_fail_count = 0
+    hallucination_err_count = 0
+    illegal_sql_count = 0
+    answered = False
+
+    if trace:
+        schema_first = bool(trace and trace[0].get("action") == "SCHEMA")
+        for step in trace:
+            act = step.get("action")
+            if act == "INVALID":
+                invalid_count += 1
+                continue
+            if act == "SQL":
+                sql_calls += 1
+                sql_text = step.get("sql") or ""
+                if _DISALLOWED_SQL.search(sql_text):
+                    illegal_sql_count += 1
+                ok = bool(step.get("ok"))
+                if ok:
+                    sql_ok_count += 1
+                else:
+                    sql_fail_count += 1
+                    if _is_hallucination_error(step.get("error")):
+                        hallucination_err_count += 1
+            if act == "ANSWER":
+                answered = True
+
+    # Shaping terms (tuned for stability, not maximal reward hacking).
+    # Positive shaping is intentionally small.
+    r_trace = 0.0
+    if schema_first is True:
+        r_trace += 0.25
+    elif schema_first is False:
+        r_trace -= 0.25
+
+    if sql_ok_count > 0:
+        r_trace += 0.25
+    else:
+        r_trace -= 0.25
+
+    if answered and sql_ok_count == 0:
+        r_trace -= 0.25
+
+    r_trace += -0.15 * min(3, invalid_count)
+    r_trace += -0.05 * min(6, max(0, sql_calls - 1))
+    r_trace += -0.10 * min(3, hallucination_err_count)
+    r_trace += -0.20 * min(1, illegal_sql_count)
+    r_trace += -0.05 * min(6, extra_steps)
+    r_trace += -0.10 if (join_pred > join_gt) else 0.0
+
+    # Clamp to [-1, 1] so weights are meaningful.
+    r_trace = max(-1.0, min(1.0, r_trace))
+
     detail.update(
         {
-            "pred_exec_ok": pred_exec.ok,
-            "pred_error": pred_exec.error,
-            "pred_rows": pred_exec.row_count,
-            "pred_truncated": pred_exec.truncated,
+            "r_exec": r_exec,
+            "r_trace": r_trace,
+            "schema_first": schema_first,
+            "invalid_count": invalid_count,
+            "sql_calls": sql_calls,
+            "sql_ok_count": sql_ok_count,
+            "sql_fail_count": sql_fail_count,
+            "hallucination_err_count": hallucination_err_count,
+            "illegal_sql_count": illegal_sql_count,
+            "extra_steps": extra_steps,
         }
     )
 
-    validity = 0.1 if pred_exec.ok else -0.5
-    hallucination = -1.0 if (not pred_exec.ok and _is_hallucination_error(pred_exec.error)) else 0.0
-
-    match, match_detail = execution_match(pred_sql, gt_sql, db_path=db_path, max_rows=max_compare_rows)
-    detail.update(match_detail)
-    detail["execution_match"] = match
-
-    correctness = 1.0 if match else -1.0
-    join_penalty = -0.2 if join_pred > join_gt else 0.0
-    step_penalty = -0.1 * extra_steps
-
-    total = correctness + validity + hallucination + join_penalty + step_penalty
-    detail.update(
-        {
-            "correctness": correctness,
-            "validity": validity,
-            "hallucination": hallucination,
-            "join_penalty": join_penalty,
-            "step_penalty": step_penalty,
-        }
-    )
-
+    total = float(weight_exec) * r_exec + float(weight_trace) * r_trace
+    detail["total"] = total
     return total, detail
-
