@@ -439,7 +439,8 @@ def main() -> None:
         model.config.use_cache = False
 
     if args.adapter_path:
-        model = PeftModel.from_pretrained(model, args.adapter_path)
+        # When continuing training from an existing adapter, ensure the adapter params are trainable.
+        model = PeftModel.from_pretrained(model, args.adapter_path, is_trainable=True)
     else:
         target_modules = [s.strip() for s in (args.lora_target_modules or "").split(",") if s.strip()]
         lora_cfg = LoraConfig(
@@ -469,7 +470,13 @@ def main() -> None:
         ).to(device)
         ref_model.eval()
 
-    optimizer = AdamW(model.parameters(), lr=float(args.learning_rate), weight_decay=float(args.weight_decay))
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    if not trainable_params:
+        raise RuntimeError(
+            "No trainable parameters found. If you provided --adapter_path, make sure it is loaded with is_trainable=True."
+        )
+
+    optimizer = AdamW(trainable_params, lr=float(args.learning_rate), weight_decay=float(args.weight_decay))
     total_updates = int(args.num_epochs) * len(items)
     total_updates = max(1, math.ceil(total_updates / max(1, int(args.grad_accum_steps))))
     scheduler = get_linear_schedule_with_warmup(
