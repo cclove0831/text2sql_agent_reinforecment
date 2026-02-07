@@ -1,4 +1,5 @@
 import hashlib
+import math
 import re
 import sqlite3
 from dataclasses import dataclass
@@ -97,8 +98,41 @@ class ExecSignature:
     sample_rows: list[tuple]  # up to 5 rows for debugging
 
 
+_FLOAT_TOL = 1e-6
+
+
+def _canonicalize_cell(v: Any) -> Any:
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return bool(v)
+    if isinstance(v, int):
+        return int(v)
+    if isinstance(v, float):
+        if math.isnan(v):
+            return "nan"
+        if math.isinf(v):
+            return "inf" if v > 0 else "-inf"
+        if abs(v) <= _FLOAT_TOL:
+            return 0
+        nearest = int(round(v))
+        if abs(v - nearest) <= _FLOAT_TOL:
+            return nearest
+        digits = max(0, int(round(-math.log10(_FLOAT_TOL))))
+        return round(v, digits)
+    if isinstance(v, memoryview):
+        return v.tobytes()
+    if isinstance(v, bytearray):
+        return bytes(v)
+    return v
+
+
+def _canonicalize_row(row: tuple[Any, ...]) -> tuple[Any, ...]:
+    return tuple(_canonicalize_cell(v) for v in row)
+
+
 def _row_digest(row: tuple[Any, ...]) -> tuple[int, int]:
-    data = repr(row).encode("utf-8", errors="replace")
+    data = repr(_canonicalize_row(row)).encode("utf-8", errors="replace")
     digest = hashlib.blake2b(data, digest_size=16).digest()
     a = int.from_bytes(digest[:8], "little", signed=False)
     b = int.from_bytes(digest[8:], "little", signed=False)
@@ -240,12 +274,34 @@ def compute_reward(
     Final reward:
         total = weight_exec * r_exec + weight_trace * r_trace
     """
-    pred_sql = (pred_sql or "").strip() or None
-    join_pred = _join_count(pred_sql or "")
-    join_gt = _join_count(gt_sql or "")
     if trace_steps is None and trace is not None:
         trace_steps = len(trace)
-    extra_steps = 0 if trace_steps is None else max(0, int(trace_steps) - 2)
+
+    pred_sql_arg = (pred_sql or "").strip() or None
+
+    # Prefer a successful SQL from the trace if available. This avoids mis-scoring
+    # trajectories where an earlier SQL succeeded but the last attempted SQL failed.
+    pred_sql_used: str | None = None
+    pred_sql_source = "none"
+    if trace:
+        for step in reversed(trace):
+            if step.get("action") == "SQL" and step.get("ok") and (step.get("sql") or "").strip():
+                pred_sql_used = str(step.get("sql") or "").strip()
+                pred_sql_source = "trace_last_ok"
+                break
+        if pred_sql_used is None:
+            for step in reversed(trace):
+                if step.get("action") == "SQL" and (step.get("sql") or "").strip():
+                    pred_sql_used = str(step.get("sql") or "").strip()
+                    pred_sql_source = "trace_last"
+                    break
+
+    if pred_sql_used is None and pred_sql_arg is not None:
+        pred_sql_used = pred_sql_arg
+        pred_sql_source = "arg"
+
+    join_pred = _join_count(pred_sql_used or "")
+    join_gt = _join_count(gt_sql or "")
 
     detail: dict[str, Any] = {
         "join_pred": join_pred,
@@ -254,14 +310,16 @@ def compute_reward(
         "max_compare_rows": max_compare_rows,
         "weight_exec": weight_exec,
         "weight_trace": weight_trace,
+        "pred_sql_source": pred_sql_source,
+        "pred_sql_used": pred_sql_used,
     }
 
     # ---- r_exec (hard correctness) ----
-    if not pred_sql:
+    if not pred_sql_used:
         r_exec = -1.0
         exec_detail = {"execution_match": False, "pred_error": "no_sql"}
     else:
-        match, match_detail = execution_match(pred_sql, gt_sql, db_path=db_path, max_rows=max_compare_rows)
+        match, match_detail = execution_match(pred_sql_used, gt_sql, db_path=db_path, max_rows=max_compare_rows)
         r_exec = 1.0 if match else -1.0
         exec_detail = {**match_detail, "execution_match": match}
 
@@ -300,18 +358,25 @@ def compute_reward(
             if act == "ANSWER":
                 answered = True
 
+    # Step penalty baseline: the shortest successful trace is typically SCHEMA -> SQL -> ANSWER (3 steps).
+    minimal_steps = 3 if answered else 2
+    extra_steps = 0 if trace_steps is None else max(0, int(trace_steps) - minimal_steps)
+
     # Shaping terms (tuned for stability, not maximal reward hacking).
     # Positive shaping is intentionally small.
     r_trace = 0.0
-    if schema_first is True:
-        r_trace += 0.25
-    elif schema_first is False:
-        r_trace -= 0.25
 
-    if sql_ok_count > 0:
-        r_trace += 0.25
-    else:
+    # Only give positive shaping when the trajectory is correct; otherwise keep shaping mostly as constraints.
+    if schema_first is False:
         r_trace -= 0.25
+    elif schema_first is True and r_exec > 0:
+        r_trace += 0.25
+
+    if trace is not None:
+        if sql_ok_count == 0:
+            r_trace -= 0.25
+        elif r_exec > 0:
+            r_trace += 0.25
 
     if answered and sql_ok_count == 0:
         r_trace -= 0.25
@@ -321,7 +386,7 @@ def compute_reward(
     r_trace += -0.10 * min(3, hallucination_err_count)
     r_trace += -0.20 * min(1, illegal_sql_count)
     r_trace += -0.05 * min(6, extra_steps)
-    r_trace += -0.10 if (join_pred > join_gt) else 0.0
+    r_trace += -0.10 if (r_exec < 0 and join_pred > join_gt) else 0.0
 
     # Clamp to [-1, 1] so weights are meaningful.
     r_trace = max(-1.0, min(1.0, r_trace))
@@ -337,6 +402,7 @@ def compute_reward(
             "sql_fail_count": sql_fail_count,
             "hallucination_err_count": hallucination_err_count,
             "illegal_sql_count": illegal_sql_count,
+            "minimal_steps": minimal_steps,
             "extra_steps": extra_steps,
         }
     )
