@@ -346,7 +346,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output_dir", type=str, required=True)
 
     parser.add_argument("--group_size", type=int, default=4)
-    parser.add_argument("--temperature", type=float, default=0.9)
+    parser.add_argument("--temperature", type=float, default=1.2)
     parser.add_argument("--top_p", type=float, default=0.95)
     parser.add_argument("--max_steps", type=int, default=8)
     parser.add_argument("--max_new_tokens", type=int, default=256)
@@ -411,6 +411,9 @@ def main() -> None:
     if not train_path.exists():
         raise FileNotFoundError(f"train_path not found: {train_path}")
     items = load_jsonl(train_path)
+    # Shuffle so that --max_groups uses a representative subset instead of always taking a fixed prefix.
+    # Deterministic given --seed.
+    random.shuffle(items)
     if int(args.max_groups) > 0:
         items = items[: int(args.max_groups)]
 
