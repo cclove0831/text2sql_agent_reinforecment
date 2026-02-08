@@ -150,16 +150,25 @@ def _generate_one(
     top_p: float,
 ) -> tuple[str, list[int]]:
     input_ids = _encode_prompt_ids(tokenizer, messages, device=device)
-    out = model.generate(
-        input_ids=input_ids,
-        max_new_tokens=int(max_new_tokens),
-        do_sample=True,
-        temperature=float(temperature),
-        top_p=float(top_p),
-        pad_token_id=int(tokenizer.pad_token_id),
-        eos_token_id=int(tokenizer.eos_token_id) if tokenizer.eos_token_id is not None else None,
-        return_dict_in_generate=True,
-    )
+    prev_use_cache = None
+    if hasattr(model, "config") and hasattr(model.config, "use_cache"):
+        prev_use_cache = bool(model.config.use_cache)
+        # Rollout is inference-only; KV cache drastically speeds up autoregressive decoding.
+        model.config.use_cache = True
+    try:
+        out = model.generate(
+            input_ids=input_ids,
+            max_new_tokens=int(max_new_tokens),
+            do_sample=True,
+            temperature=float(temperature),
+            top_p=float(top_p),
+            pad_token_id=int(tokenizer.pad_token_id),
+            eos_token_id=int(tokenizer.eos_token_id) if tokenizer.eos_token_id is not None else None,
+            return_dict_in_generate=True,
+        )
+    finally:
+        if prev_use_cache is not None:
+            model.config.use_cache = prev_use_cache
     seq = out.sequences[0]
     gen_ids = seq[input_ids.shape[1] :].tolist()
     text = tokenizer.decode(gen_ids, skip_special_tokens=True)
@@ -381,6 +390,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bf16", action="store_true")
     parser.add_argument("--fp16", action="store_true")
     parser.add_argument("--gradient_checkpointing", action="store_true")
+    parser.add_argument(
+        "--attn_implementation",
+        type=str,
+        default="auto",
+        help="Attention backend: auto|sdpa|flash_attention_2. sdpa needs no extra deps; flash_attention_2 requires flash-attn.",
+    )
     parser.add_argument("--trust_remote_code", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
@@ -430,11 +445,23 @@ def main() -> None:
     elif bool(args.fp16):
         dtype = torch.float16
 
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_name_or_path,
-        torch_dtype=dtype,
-        trust_remote_code=bool(args.trust_remote_code),
-    )
+    model_kwargs: dict[str, Any] = {
+        "torch_dtype": dtype,
+        "trust_remote_code": bool(args.trust_remote_code),
+    }
+    attn_impl = (args.attn_implementation or "").strip()
+    if attn_impl and attn_impl.lower() != "auto":
+        model_kwargs["attn_implementation"] = attn_impl
+    try:
+        model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, **model_kwargs)
+    except TypeError as e:
+        # Older transformers/model definitions may not accept this kwarg.
+        if "attn_implementation" in str(e):
+            model_kwargs.pop("attn_implementation", None)
+            print(f"[warn] attn_implementation not supported ({e}); falling back to default attention.")
+            model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, **model_kwargs)
+        else:
+            raise
 
     if bool(args.gradient_checkpointing):
         model.gradient_checkpointing_enable()
@@ -466,11 +493,16 @@ def main() -> None:
         if not args.ref_model_name_or_path:
             # Avoid silently doubling memory by deepcopy; require an explicit ref model path.
             raise ValueError("--kl_beta > 0 requires --ref_model_name_or_path")
-        ref_model = AutoModelForCausalLM.from_pretrained(
-            args.ref_model_name_or_path,
-            torch_dtype=dtype,
-            trust_remote_code=bool(args.trust_remote_code),
-        ).to(device)
+        try:
+            ref_model = AutoModelForCausalLM.from_pretrained(args.ref_model_name_or_path, **model_kwargs).to(device)
+        except TypeError as e:
+            if "attn_implementation" in str(e):
+                ref_kwargs = dict(model_kwargs)
+                ref_kwargs.pop("attn_implementation", None)
+                print(f"[warn] ref attn_implementation not supported ({e}); falling back to default attention.")
+                ref_model = AutoModelForCausalLM.from_pretrained(args.ref_model_name_or_path, **ref_kwargs).to(device)
+            else:
+                raise
         ref_model.eval()
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
