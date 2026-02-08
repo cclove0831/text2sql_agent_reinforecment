@@ -544,7 +544,9 @@ def main() -> None:
             adv = (rewards_t - mean_r) / (std_r + 1e-6)
 
             model.train()
-            group_loss = torch.tensor(0.0, device=device)
+            # Backprop per-trajectory to avoid holding the computation graphs of the whole group at once.
+            # This significantly reduces peak VRAM, especially when gradient checkpointing is disabled.
+            loss_scale = 1.0 / float(max(1, int(args.group_size))) / float(max(1, int(args.grad_accum_steps)))
             for i, traj in enumerate(samples):
                 lp_sum, n_tokens = policy_logprob_sum(model, tokenizer, traj["trace"], device=device)
                 denom = max(1, int(n_tokens))
@@ -558,11 +560,8 @@ def main() -> None:
                     kl_term = lp - ref_lp
 
                 loss_i = (-adv[i].detach() * lp) + (float(args.kl_beta) * kl_term)
-                group_loss = group_loss + loss_i
-
-            group_loss = group_loss / float(max(1, int(args.group_size)))
-            group_loss = group_loss / float(max(1, int(args.grad_accum_steps)))
-            group_loss.backward()
+                (loss_i * float(loss_scale)).backward()
+                del lp_sum, lp, kl_term, loss_i
 
             if group_idx % int(args.grad_accum_steps) == 0:
                 if float(args.max_grad_norm) > 0:
