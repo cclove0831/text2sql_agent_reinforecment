@@ -390,6 +390,7 @@ def compute_reward(
     # Keep shaping in [-1, 1] and smaller than the hard reward.
     schema_first = None
     invalid_count = 0
+    early_answer_count = 0
     sql_calls = 0
     sql_ok_count = 0
     sql_fail_count = 0
@@ -403,6 +404,8 @@ def compute_reward(
             act = step.get("action")
             if act == "INVALID":
                 invalid_count += 1
+                if (step.get("invalid_type") or "") == "answer_before_sql_ok":
+                    early_answer_count += 1
                 continue
             if act == "SQL":
                 sql_calls += 1
@@ -444,6 +447,7 @@ def compute_reward(
         r_trace -= 0.50
 
     r_trace += -0.15 * min(3, invalid_count)
+    r_trace += -0.50 * min(2, early_answer_count)
     r_trace += -0.05 * min(6, max(0, sql_calls - 1))
     r_trace += -0.03 * min(6, sql_fail_count)
     r_trace += -0.10 * min(3, hallucination_err_count)
@@ -486,6 +490,7 @@ def compute_reward(
             "overlap_bonus": overlap_bonus,
             "schema_first": schema_first,
             "invalid_count": invalid_count,
+            "early_answer_count": early_answer_count,
             "sql_calls": sql_calls,
             "sql_ok_count": sql_ok_count,
             "sql_fail_count": sql_fail_count,

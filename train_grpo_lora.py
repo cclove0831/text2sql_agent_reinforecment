@@ -210,7 +210,15 @@ def rollout_trajectory(
 
     messages: list[dict[str, str]] = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": f"Question: {question}\n\nRemember: start by outputting [SCHEMA]."},
+        {
+            "role": "user",
+            "content": (
+                f"问题：{question}\n\n"
+                "记住：第一步必须输出 [SCHEMA]。\n"
+                "在至少有一次 SQL 成功执行（ok=True）之前，不要输出 [ANSWER]。\n"
+                "如果 SQL 执行失败，请继续输出新的 [SQL] 进行纠错（必要时可再输出 [SCHEMA] 查看表结构）。"
+            ),
+        },
     ]
 
     trace: list[dict[str, Any]] = []
@@ -283,6 +291,26 @@ def rollout_trajectory(
             answer = (payload or "").strip()
             if not answer and last_answer is not None:
                 answer = last_answer
+            if last_answer is None:
+                err_hint = f"\n最近一次 SQL 错误: {last_error}" if last_error else ""
+                invalid_obs = (
+                    "Observation:\nError: 在没有任何成功 SQL 执行之前禁止输出 [ANSWER]。\n"
+                    "请输出 [SQL] 修正查询（或 [SCHEMA] 查看数据库结构）。"
+                    f"{err_hint}"
+                )
+                messages.append({"role": "user", "content": invalid_obs})
+                trace.append(
+                    {
+                        "step": step_idx,
+                        "action": "INVALID",
+                        "model": model_text,
+                        "token_ids": token_ids,
+                        "prompt_messages": prompt_snapshot,
+                        "error": invalid_obs,
+                        "invalid_type": "answer_before_sql_ok",
+                    }
+                )
+                continue
             trace.append(
                 {
                     "step": step_idx,
@@ -363,6 +391,41 @@ def policy_logprob_sum(
     return total, n_tokens
 
 
+def _active_adapter_name(model: Any) -> str | None:
+    # PEFT uses adapter names like "default". We support multiple PEFT versions here.
+    name = getattr(model, "active_adapter", None)
+    if isinstance(name, str) and name:
+        return name
+    names = getattr(model, "active_adapters", None)
+    if isinstance(names, (list, tuple)) and names and isinstance(names[0], str):
+        return names[0]
+    return None
+
+
+def _set_active_adapter(model: Any, adapter_name: str) -> None:
+    if not adapter_name:
+        return
+    if hasattr(model, "set_adapter"):
+        model.set_adapter(adapter_name)
+
+
+def _load_ref_adapter(model: Any, adapter_path: str, adapter_name: str) -> None:
+    # Best-effort compatibility across PEFT versions.
+    if not hasattr(model, "load_adapter"):
+        raise ValueError("Model does not support loading multiple adapters; upgrade peft or use --ref_model_name_or_path.")
+    try:
+        model.load_adapter(adapter_path, adapter_name=adapter_name, is_trainable=False)
+        return
+    except TypeError:
+        pass
+    try:
+        model.load_adapter(adapter_path, adapter_name, is_trainable=False)
+        return
+    except TypeError:
+        pass
+    model.load_adapter(adapter_path, adapter_name)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="GRPO + LoRA for multi-step Text2SQL agent (local HF model).")
     parser.add_argument("--model_name_or_path", type=str, required=True)
@@ -395,6 +458,21 @@ def parse_args() -> argparse.Namespace:
         help="Skip policy update when reward std < this threshold (and kl_beta==0).",
     )
     parser.add_argument(
+        "--no_ex_update",
+        type=str,
+        default="kl_only",
+        choices=["update", "skip", "scale", "kl_only"],
+        help="What to do when a group has ex@group==0 (no execution-correct samples). "
+        "'skip' skips the update; 'kl_only' zeroes the policy-gradient term but keeps KL (if enabled); "
+        "'scale' scales the policy-gradient term by --no_ex_scale; 'update' does a normal update.",
+    )
+    parser.add_argument(
+        "--no_ex_scale",
+        type=float,
+        default=0.25,
+        help="Only used when --no_ex_update=scale. Scale factor for the policy-gradient term in no-EX groups.",
+    )
+    parser.add_argument(
         "--debug_tie_groups",
         action="store_true",
         help="Print SQL hashes for near-tie groups (stdR < skip_update_std) to diagnose sampling collapse vs reward ties.",
@@ -422,6 +500,20 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--kl_beta", type=float, default=0.0)
     parser.add_argument("--ref_model_name_or_path", type=str, default=None)
+    parser.add_argument(
+        "--ref_adapter_path",
+        type=str,
+        default=None,
+        help="Optional LoRA adapter to use as the reference policy for KL. "
+        "If omitted and --adapter_path is set, defaults to --adapter_path.",
+    )
+    parser.add_argument("--ref_adapter_name", type=str, default="ref", help="Adapter name for the in-model reference.")
+    parser.add_argument(
+        "--adv_clip",
+        type=float,
+        default=5.0,
+        help="Clip normalized advantages to [-adv_clip, adv_clip]. 0 disables clipping.",
+    )
 
     parser.add_argument("--lora_r", type=int, default=16)
     parser.add_argument("--lora_alpha", type=int, default=32)
@@ -474,6 +566,8 @@ def main() -> None:
     args = parse_args()
     random.seed(int(args.seed))
     torch.manual_seed(int(args.seed))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(args.seed))
     debug_tie_left = int(args.debug_tie_max)
 
     train_path = _resolve_repo_path(_normalize_rel_path(args.train_path) or args.train_path)
@@ -548,27 +642,45 @@ def main() -> None:
         )
         model = get_peft_model(model, lora_cfg)
 
+    policy_adapter = _active_adapter_name(model)
+
     model.print_trainable_parameters()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
 
     ref_model = None
+    ref_adapter = None
     if float(args.kl_beta) > 0.0:
-        if not args.ref_model_name_or_path:
-            # Avoid silently doubling memory by deepcopy; require an explicit ref model path.
-            raise ValueError("--kl_beta > 0 requires --ref_model_name_or_path")
-        try:
-            ref_model = AutoModelForCausalLM.from_pretrained(args.ref_model_name_or_path, **model_kwargs).to(device)
-        except TypeError as e:
-            if "attn_implementation" in str(e):
-                ref_kwargs = dict(model_kwargs)
-                ref_kwargs.pop("attn_implementation", None)
-                print(f"[warn] ref attn_implementation not supported ({e}); falling back to default attention.")
-                ref_model = AutoModelForCausalLM.from_pretrained(args.ref_model_name_or_path, **ref_kwargs).to(device)
-            else:
-                raise
-        ref_model.eval()
+        if args.ref_model_name_or_path:
+            # Explicit separate reference model (costs extra VRAM, but supports different base weights).
+            try:
+                ref_model = AutoModelForCausalLM.from_pretrained(args.ref_model_name_or_path, **model_kwargs).to(device)
+            except TypeError as e:
+                if "attn_implementation" in str(e):
+                    ref_kwargs = dict(model_kwargs)
+                    ref_kwargs.pop("attn_implementation", None)
+                    print(f"[warn] ref attn_implementation not supported ({e}); falling back to default attention.")
+                    ref_model = AutoModelForCausalLM.from_pretrained(args.ref_model_name_or_path, **ref_kwargs).to(device)
+                else:
+                    raise
+            if args.ref_adapter_path:
+                ref_model = PeftModel.from_pretrained(ref_model, args.ref_adapter_path, is_trainable=False)
+            ref_model.eval()
+        else:
+            # Memory-friendly KL: keep a frozen reference adapter in the same PEFT model and switch adapters.
+            ref_adapter_path = args.ref_adapter_path or args.adapter_path
+            if not ref_adapter_path:
+                raise ValueError(
+                    "--kl_beta > 0 requires either --ref_model_name_or_path, or --ref_adapter_path/--adapter_path to build a reference policy."
+                )
+            ref_adapter = str(args.ref_adapter_name or "ref").strip() or "ref"
+            _load_ref_adapter(model, str(ref_adapter_path), ref_adapter)
+            # Freeze ref adapter parameters defensively.
+            for n, p in model.named_parameters():
+                if f".{ref_adapter}." in n:
+                    p.requires_grad = False
+
+    model.to(device)
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     if not trainable_params:
@@ -659,8 +771,36 @@ def main() -> None:
             mean_r = rewards_t.mean()
             std_r = rewards_t.std(unbiased=False)
             adv = (rewards_t - mean_r) / (std_r + 1e-6)
+            if float(args.adv_clip) > 0:
+                adv = adv.clamp(min=-float(args.adv_clip), max=float(args.adv_clip))
 
-            skipped_update = bool(float(args.kl_beta) == 0.0 and float(std_r.item()) < skip_update_std)
+            ex_rate = sum(1 for s in samples if (s.get("reward_detail") or {}).get("execution_match")) / float(
+                max(1, len(samples))
+            )
+            adv_weight = 1.0
+            skip_reason = ""
+
+            if ex_rate <= 0.0:
+                mode = (args.no_ex_update or "kl_only").strip().lower()
+                if mode == "skip":
+                    skip_reason = "no_ex"
+                elif mode == "kl_only":
+                    adv_weight = 0.0
+                    skip_reason = "no_ex_kl_only"
+                elif mode == "scale":
+                    adv_weight = float(args.no_ex_scale)
+                    skip_reason = f"no_ex_scale={adv_weight:g}"
+
+            skipped_update = False
+            if float(args.kl_beta) == 0.0 and float(std_r.item()) < skip_update_std:
+                skipped_update = True
+                skip_reason = "low_std"
+            elif skip_reason == "no_ex":
+                skipped_update = True
+            elif float(args.kl_beta) == 0.0 and float(adv_weight) == 0.0:
+                # "kl_only" degenerates to a no-op update when KL is disabled.
+                skipped_update = True
+                skip_reason = "no_ex"
             deterministic_prefix = _is_deterministic_prefix(samples)
             if bool(args.debug_tie_groups) and debug_tie_left > 0 and deterministic_prefix and skipped_update:
                 sqls = [((s.get("reward_detail") or {}).get("pred_sql_used") or "").strip() for s in samples]
@@ -681,22 +821,51 @@ def main() -> None:
                 # Backprop per-trajectory to avoid holding the computation graphs of the whole group at once.
                 # This significantly reduces peak VRAM, especially when gradient checkpointing is disabled.
                 loss_scale = 1.0 / float(max(1, len(samples))) / float(max(1, int(args.grad_accum_steps)))
+                kl_sum = torch.tensor(0.0, device=device)
+                kl_n = 0
                 for i, traj in enumerate(samples):
                     lp_sum, n_tokens = policy_logprob_sum(model, tokenizer, traj["trace"], device=device)
                     denom = max(1, int(n_tokens))
                     lp = lp_sum / float(denom)
 
                     kl_term = torch.tensor(0.0, device=device)
-                    if ref_model is not None:
-                        with torch.no_grad():
-                            ref_lp_sum, ref_n = policy_logprob_sum(ref_model, tokenizer, traj["trace"], device=device)
-                            ref_lp = ref_lp_sum / float(max(1, int(ref_n)))
-                        kl_term = lp - ref_lp
+                    if float(args.kl_beta) > 0.0:
+                        if ref_model is not None:
+                            with torch.no_grad():
+                                ref_lp_sum, ref_n = policy_logprob_sum(ref_model, tokenizer, traj["trace"], device=device)
+                                ref_lp = ref_lp_sum / float(max(1, int(ref_n)))
+                            kl_term = lp - ref_lp
+                        elif ref_adapter is not None:
+                            with torch.no_grad():
+                                prev_adapter = policy_adapter or _active_adapter_name(model)
+                                prev_training = bool(getattr(model, "training", False))
+                                model.eval()
+                                try:
+                                    _set_active_adapter(model, ref_adapter)
+                                    ref_lp_sum, ref_n = policy_logprob_sum(model, tokenizer, traj["trace"], device=device)
+                                    ref_lp = ref_lp_sum / float(max(1, int(ref_n)))
+                                finally:
+                                    if prev_adapter:
+                                        _set_active_adapter(model, prev_adapter)
+                                    if prev_training:
+                                        model.train()
+                            kl_term = lp - ref_lp
+                        kl_sum = kl_sum + kl_term.detach()
+                        kl_n += 1
 
-                    loss_i = (-adv[i].detach() * lp) + (float(args.kl_beta) * kl_term)
+                    loss_i = (-(adv[i].detach() * float(adv_weight)) * lp) + (float(args.kl_beta) * kl_term)
                     (loss_i * float(loss_scale)).backward()
                     del lp_sum, lp, kl_term, loss_i
                 pending_grads = True
+                if tb_writer is not None:
+                    try:
+                        tb_writer.add_scalar(
+                            "train/kl_mean",
+                            float((kl_sum / float(max(1, kl_n))).item()) if kl_n > 0 else 0.0,
+                            int(group_idx),
+                        )
+                    except Exception:
+                        pass
 
             if group_idx % int(args.grad_accum_steps) == 0 and pending_grads:
                 if float(args.max_grad_norm) > 0:
@@ -714,12 +883,9 @@ def main() -> None:
                         pass
 
             if int(args.log_every) > 0 and group_idx % int(args.log_every) == 0:
-                ex_rate = sum(1 for s in samples if (s.get("reward_detail") or {}).get("execution_match")) / float(
-                    max(1, len(samples))
-                )
                 avg_steps = sum(len(s.get("trace") or []) for s in samples) / float(max(1, len(samples)))
                 gs = f" gs={len(samples)}" if adaptive else ""
-                note = " (skip_update)" if skipped_update else ""
+                note = f" (skip_update:{skip_reason})" if skipped_update else ""
                 print(
                     f"[epoch={epoch+1} group={group_idx}/{len(items)} step={step}] "
                     f"meanR={mean_r.item():.4f} stdR={std_r.item():.4f} ex@group={ex_rate:.3f} avg_steps={avg_steps:.2f}{gs}{note}"
@@ -733,6 +899,7 @@ def main() -> None:
                         tb_writer.add_scalar("train/avg_steps", float(avg_steps), x)
                         tb_writer.add_scalar("train/group_size_effective", float(len(samples)), x)
                         tb_writer.add_scalar("train/skip_update", 1.0 if skipped_update else 0.0, x)
+                        tb_writer.add_scalar("train/adv_weight", float(adv_weight), x)
                         tb_writer.add_scalar("train/epoch", float(epoch + 1), x)
                     except Exception:
                         pass
@@ -742,6 +909,22 @@ def main() -> None:
                 save_dir.mkdir(parents=True, exist_ok=True)
                 model.save_pretrained(str(save_dir))
                 tokenizer.save_pretrained(str(save_dir))
+
+        # Flush any remaining gradient accumulation at epoch end.
+        if pending_grads:
+            if float(args.max_grad_norm) > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), float(args.max_grad_norm))
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad(set_to_none=True)
+            step += 1
+            pending_grads = False
+            if tb_writer is not None:
+                try:
+                    lr = float(scheduler.get_last_lr()[0])
+                    tb_writer.add_scalar("train/learning_rate", lr, step)
+                except Exception:
+                    pass
 
         # Save at end of epoch
         save_dir = output_dir / f"epoch{epoch+1}"

@@ -167,7 +167,12 @@ class Text2SQLAgent:
             {"role": "system", "content": SYSTEM},
             {
                 "role": "user",
-                "content": f"Question: {question}\n\nRemember: start by outputting [SCHEMA].",
+                "content": (
+                    f"问题：{question}\n\n"
+                    "记住：第一步必须输出 [SCHEMA]。\n"
+                    "在至少有一次 SQL 成功执行（ok=True）之前，不要输出 [ANSWER]。\n"
+                    "如果 SQL 执行失败，请继续输出新的 [SQL] 进行纠错（必要时可再输出 [SCHEMA] 查看表结构）。"
+                ),
             },
         ]
 
@@ -232,14 +237,31 @@ class Text2SQLAgent:
                 answer = (payload or "").strip()
                 if not answer and last_answer is not None:
                     answer = last_answer
+                if last_answer is None:
+                    err_hint = f"\n最近一次 SQL 错误: {last_error}" if last_error else ""
+                    invalid_obs = (
+                        "Observation:\nError: 在没有任何成功 SQL 执行之前禁止输出 [ANSWER]。"
+                        "请输出 [SQL] 修正查询（或 [SCHEMA] 查看数据库结构）。"
+                        f"{err_hint}"
+                    )
+                    messages.append({"role": "user", "content": invalid_obs})
+                    trace.append(
+                        {
+                            "step": step_idx,
+                            "action": "INVALID",
+                            "model": model_text,
+                            "error": invalid_obs,
+                            "invalid_type": "answer_before_sql_ok",
+                        }
+                    )
+                    continue
 
-                ok = last_answer is not None
                 trace.append({"step": step_idx, "action": "ANSWER", "answer": answer, "model": model_text})
                 return {
-                    "ok": ok,
+                    "ok": True,
                     "sql": last_sql,
                     "sql_history": sql_history,
-                    "error": None if ok else (last_error or "No successful SQL executed."),
+                    "error": None,
                     "answer": answer,
                     "trace": trace,
                     "db_path": db_path,
