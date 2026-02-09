@@ -679,6 +679,13 @@ def main() -> None:
             for n, p in model.named_parameters():
                 if f".{ref_adapter}." in n:
                     p.requires_grad = False
+            # Some PEFT versions switch the "active" adapter on load_adapter and may toggle trainability.
+            # Ensure we keep training the policy adapter after attaching the frozen reference adapter.
+            if policy_adapter:
+                _set_active_adapter(model, policy_adapter)
+                for n, p in model.named_parameters():
+                    if f".{policy_adapter}." in n:
+                        p.requires_grad = True
 
     model.to(device)
 
