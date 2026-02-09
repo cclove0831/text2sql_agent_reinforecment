@@ -19,6 +19,21 @@ from utils import rows_to_answer
 PROJECT_ROOT = Path(__file__).resolve().parent
 
 
+def _maybe_create_tb_writer(log_dir: str | Path | None):
+    if not log_dir:
+        return None
+    try:
+        from torch.utils.tensorboard import SummaryWriter  # type: ignore
+    except Exception as e:
+        print(f"[warn] TensorBoard SummaryWriter not available ({e}). Install with: pip install tensorboard")
+        return None
+    try:
+        return SummaryWriter(log_dir=str(log_dir))
+    except Exception as e:
+        print(f"[warn] Failed to create TensorBoard writer at {log_dir!r} ({e}).")
+        return None
+
+
 def _resolve_repo_path(p: str | Path) -> Path:
     path = Path(p)
     if path.is_absolute():
@@ -355,6 +370,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output_dir", type=str, required=True)
 
     parser.add_argument("--group_size", type=int, default=4)
+    parser.add_argument(
+        "--adaptive_group_sampling",
+        action="store_true",
+        help="Dynamically reduce rollout samples per group when rewards already have enough variance (or no variance).",
+    )
+    parser.add_argument(
+        "--min_group_size",
+        type=int,
+        default=4,
+        help="Only used with --adaptive_group_sampling. Minimum rollouts per group before early stopping.",
+    )
+    parser.add_argument(
+        "--target_reward_std",
+        type=float,
+        default=0.50,
+        help="Only used with --adaptive_group_sampling. Stop sampling early once reward std >= this threshold.",
+    )
+    parser.add_argument(
+        "--skip_update_std",
+        type=float,
+        default=1e-3,
+        help="Skip policy update when reward std < this threshold (and kl_beta==0).",
+    )
     parser.add_argument("--temperature", type=float, default=1.2)
     parser.add_argument("--top_p", type=float, default=0.95)
     parser.add_argument("--max_steps", type=int, default=8)
@@ -398,6 +436,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--trust_remote_code", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
+
+    parser.add_argument("--tensorboard", action="store_true", help="Log training scalars to TensorBoard.")
+    parser.add_argument(
+        "--tb_logdir",
+        type=str,
+        default=None,
+        help="TensorBoard log dir (default: <output_dir>/tb when --tensorboard is set).",
+    )
     return parser.parse_args()
 
 
@@ -434,6 +480,17 @@ def main() -> None:
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    tb_logdir = None
+    if bool(args.tensorboard):
+        tb_logdir = args.tb_logdir or str(output_dir / "tb")
+    elif args.tb_logdir:
+        tb_logdir = str(args.tb_logdir)
+    tb_writer = _maybe_create_tb_writer(tb_logdir)
+    if tb_writer is not None:
+        try:
+            tb_writer.add_text("config/args", json.dumps(vars(args), ensure_ascii=False, indent=2))
+        except Exception:
+            pass
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, trust_remote_code=bool(args.trust_remote_code))
     if tokenizer.pad_token_id is None:
@@ -524,6 +581,7 @@ def main() -> None:
     max_compare_rows = None if int(args.max_compare_rows) < 0 else int(args.max_compare_rows)
 
     step = 0
+    pending_grads = False
     model.train()
 
     for epoch in range(int(args.num_epochs)):
@@ -540,8 +598,18 @@ def main() -> None:
             model.eval()
             samples: list[dict[str, Any]] = []
             rewards: list[float] = []
+            max_group_size = int(args.group_size)
+            min_group_size = max(1, min(int(args.min_group_size), max_group_size))
+            target_reward_std = float(args.target_reward_std)
+            skip_update_std = float(args.skip_update_std)
+            adaptive = bool(args.adaptive_group_sampling)
 
-            for _ in range(int(args.group_size)):
+            def _is_deterministic_prefix(ss: list[dict[str, Any]]) -> bool:
+                pred_sqls = {(s.get("reward_detail") or {}).get("pred_sql_used") for s in ss}
+                ex_flags = {(s.get("reward_detail") or {}).get("execution_match") for s in ss}
+                return (len(pred_sqls) <= 1) and (len(ex_flags) <= 1)
+
+            for _ in range(max_group_size):
                 traj = rollout_trajectory(
                     model,
                     tokenizer,
@@ -570,48 +638,81 @@ def main() -> None:
                 samples.append(traj)
                 rewards.append(float(r))
 
+                if adaptive and len(samples) >= min_group_size:
+                    # Decide whether to stop sampling early to save compute.
+                    rewards_t_tmp = torch.tensor(rewards, dtype=torch.float32, device=device)
+                    std_tmp = float(rewards_t_tmp.std(unbiased=False).item())
+                    if std_tmp >= target_reward_std:
+                        break
+                    if std_tmp < skip_update_std and _is_deterministic_prefix(samples):
+                        break
+
             rewards_t = torch.tensor(rewards, dtype=torch.float32, device=device)
             mean_r = rewards_t.mean()
             std_r = rewards_t.std(unbiased=False)
             adv = (rewards_t - mean_r) / (std_r + 1e-6)
 
-            model.train()
-            # Backprop per-trajectory to avoid holding the computation graphs of the whole group at once.
-            # This significantly reduces peak VRAM, especially when gradient checkpointing is disabled.
-            loss_scale = 1.0 / float(max(1, int(args.group_size))) / float(max(1, int(args.grad_accum_steps)))
-            for i, traj in enumerate(samples):
-                lp_sum, n_tokens = policy_logprob_sum(model, tokenizer, traj["trace"], device=device)
-                denom = max(1, int(n_tokens))
-                lp = lp_sum / float(denom)
+            skipped_update = bool(float(args.kl_beta) == 0.0 and float(std_r.item()) < skip_update_std)
+            if not skipped_update:
+                model.train()
+                # Backprop per-trajectory to avoid holding the computation graphs of the whole group at once.
+                # This significantly reduces peak VRAM, especially when gradient checkpointing is disabled.
+                loss_scale = 1.0 / float(max(1, len(samples))) / float(max(1, int(args.grad_accum_steps)))
+                for i, traj in enumerate(samples):
+                    lp_sum, n_tokens = policy_logprob_sum(model, tokenizer, traj["trace"], device=device)
+                    denom = max(1, int(n_tokens))
+                    lp = lp_sum / float(denom)
 
-                kl_term = torch.tensor(0.0, device=device)
-                if ref_model is not None:
-                    with torch.no_grad():
-                        ref_lp_sum, ref_n = policy_logprob_sum(ref_model, tokenizer, traj["trace"], device=device)
-                        ref_lp = ref_lp_sum / float(max(1, int(ref_n)))
-                    kl_term = lp - ref_lp
+                    kl_term = torch.tensor(0.0, device=device)
+                    if ref_model is not None:
+                        with torch.no_grad():
+                            ref_lp_sum, ref_n = policy_logprob_sum(ref_model, tokenizer, traj["trace"], device=device)
+                            ref_lp = ref_lp_sum / float(max(1, int(ref_n)))
+                        kl_term = lp - ref_lp
 
-                loss_i = (-adv[i].detach() * lp) + (float(args.kl_beta) * kl_term)
-                (loss_i * float(loss_scale)).backward()
-                del lp_sum, lp, kl_term, loss_i
+                    loss_i = (-adv[i].detach() * lp) + (float(args.kl_beta) * kl_term)
+                    (loss_i * float(loss_scale)).backward()
+                    del lp_sum, lp, kl_term, loss_i
+                pending_grads = True
 
-            if group_idx % int(args.grad_accum_steps) == 0:
+            if group_idx % int(args.grad_accum_steps) == 0 and pending_grads:
                 if float(args.max_grad_norm) > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), float(args.max_grad_norm))
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 step += 1
+                pending_grads = False
+                if tb_writer is not None:
+                    try:
+                        lr = float(scheduler.get_last_lr()[0])
+                        tb_writer.add_scalar("train/learning_rate", lr, step)
+                    except Exception:
+                        pass
 
             if int(args.log_every) > 0 and group_idx % int(args.log_every) == 0:
                 ex_rate = sum(1 for s in samples if (s.get("reward_detail") or {}).get("execution_match")) / float(
                     max(1, len(samples))
                 )
                 avg_steps = sum(len(s.get("trace") or []) for s in samples) / float(max(1, len(samples)))
+                gs = f" gs={len(samples)}" if adaptive else ""
+                note = " (skip_update)" if skipped_update else ""
                 print(
                     f"[epoch={epoch+1} group={group_idx}/{len(items)} step={step}] "
-                    f"meanR={mean_r.item():.4f} stdR={std_r.item():.4f} ex@group={ex_rate:.3f} avg_steps={avg_steps:.2f}"
+                    f"meanR={mean_r.item():.4f} stdR={std_r.item():.4f} ex@group={ex_rate:.3f} avg_steps={avg_steps:.2f}{gs}{note}"
                 )
+                if tb_writer is not None:
+                    x = int(group_idx)
+                    try:
+                        tb_writer.add_scalar("train/mean_reward", float(mean_r.item()), x)
+                        tb_writer.add_scalar("train/std_reward", float(std_r.item()), x)
+                        tb_writer.add_scalar("train/ex_rate", float(ex_rate), x)
+                        tb_writer.add_scalar("train/avg_steps", float(avg_steps), x)
+                        tb_writer.add_scalar("train/group_size_effective", float(len(samples)), x)
+                        tb_writer.add_scalar("train/skip_update", 1.0 if skipped_update else 0.0, x)
+                        tb_writer.add_scalar("train/epoch", float(epoch + 1), x)
+                    except Exception:
+                        pass
 
             if int(args.save_every) > 0 and group_idx % int(args.save_every) == 0:
                 save_dir = output_dir / f"checkpoint_group{group_idx:06d}"
@@ -624,6 +725,13 @@ def main() -> None:
         save_dir.mkdir(parents=True, exist_ok=True)
         model.save_pretrained(str(save_dir))
         tokenizer.save_pretrained(str(save_dir))
+
+    if tb_writer is not None:
+        try:
+            tb_writer.flush()
+            tb_writer.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
