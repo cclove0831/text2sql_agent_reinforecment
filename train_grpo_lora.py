@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import json
 import math
 import random
@@ -393,6 +394,12 @@ def parse_args() -> argparse.Namespace:
         default=1e-3,
         help="Skip policy update when reward std < this threshold (and kl_beta==0).",
     )
+    parser.add_argument(
+        "--debug_tie_groups",
+        action="store_true",
+        help="Print SQL hashes for near-tie groups (stdR < skip_update_std) to diagnose sampling collapse vs reward ties.",
+    )
+    parser.add_argument("--debug_tie_max", type=int, default=5, help="Max number of tie-group debug prints.")
     parser.add_argument("--temperature", type=float, default=1.2)
     parser.add_argument("--top_p", type=float, default=0.95)
     parser.add_argument("--max_steps", type=int, default=8)
@@ -467,6 +474,7 @@ def main() -> None:
     args = parse_args()
     random.seed(int(args.seed))
     torch.manual_seed(int(args.seed))
+    debug_tie_left = int(args.debug_tie_max)
 
     train_path = _resolve_repo_path(_normalize_rel_path(args.train_path) or args.train_path)
     if not train_path.exists():
@@ -653,6 +661,21 @@ def main() -> None:
             adv = (rewards_t - mean_r) / (std_r + 1e-6)
 
             skipped_update = bool(float(args.kl_beta) == 0.0 and float(std_r.item()) < skip_update_std)
+            deterministic_prefix = _is_deterministic_prefix(samples)
+            if bool(args.debug_tie_groups) and debug_tie_left > 0 and deterministic_prefix and skipped_update:
+                sqls = [((s.get("reward_detail") or {}).get("pred_sql_used") or "").strip() for s in samples]
+                hashes = [
+                    hashlib.blake2b(s.encode("utf-8", errors="ignore"), digest_size=6).hexdigest() if s else "none"
+                    for s in sqls
+                ]
+                uniq = {}
+                for h in hashes:
+                    uniq[h] = uniq.get(h, 0) + 1
+                top = ", ".join([f"{k}:{v}" for k, v in sorted(uniq.items(), key=lambda kv: (-kv[1], kv[0]))[:6]])
+                print(
+                    f"[debug] tie group={group_idx} stdR={float(std_r.item()):.6f} uniq_sql={len(set(sqls))}/{len(sqls)} hashes={top}"
+                )
+                debug_tie_left -= 1
             if not skipped_update:
                 model.train()
                 # Backprop per-trajectory to avoid holding the computation graphs of the whole group at once.

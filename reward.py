@@ -81,6 +81,51 @@ def _join_count(sql: str) -> int:
     return len(re.findall(r"\bjoin\b", sql or "", flags=re.IGNORECASE))
 
 
+_SQL_WHITESPACE = re.compile(r"\s+")
+
+
+def _normalize_sql_for_scoring(sql: str) -> str:
+    s = _sanitize_sql(sql)
+    s = s.replace("\u3000", " ")
+    s = _SQL_WHITESPACE.sub(" ", s).strip()
+    return s
+
+
+def _extract_tables(sql: str) -> set[str]:
+    # Heuristic: table identifiers that directly follow FROM/JOIN.
+    # This is intentionally simple and only used for reward shaping.
+    s = _normalize_sql_for_scoring(sql).lower()
+    # Strip common quoting characters so regex can be simpler.
+    s = s.translate(str.maketrans({'"': " ", "'": " ", "`": " ", "[": " ", "]": " "}))
+    tables: set[str] = set()
+    for m in re.finditer(r"\b(?:from|join)\s+([a-zA-Z_][\w\.]*)\b", s):
+        tok = (m.group(1) or "").strip()
+        if not tok or tok.startswith("("):
+            continue
+        if "." in tok:
+            tok = tok.split(".")[-1]
+        tables.add(tok)
+    return tables
+
+
+def _extract_dot_columns(sql: str) -> set[str]:
+    # Heuristic: column identifiers used as <alias>.<column>.
+    s = _normalize_sql_for_scoring(sql).lower()
+    s = s.translate(str.maketrans({'"': " ", "'": " ", "`": " ", "[": " ", "]": " "}))
+    cols: set[str] = set()
+    for m in re.finditer(r"\b[a-zA-Z_]\w*\s*\.\s*([a-zA-Z_]\w*)\b", s):
+        col = (m.group(1) or "").strip()
+        if col:
+            cols.add(col)
+    return cols
+
+
+def _recall(pred: set[str], gold: set[str]) -> float:
+    if not gold:
+        return 0.0
+    return float(len(pred & gold)) / float(len(gold))
+
+
 def _is_hallucination_error(error: str | None) -> bool:
     if not error:
         return False
@@ -300,12 +345,28 @@ def compute_reward(
         pred_sql_used = pred_sql_arg
         pred_sql_source = "arg"
 
-    join_pred = _join_count(pred_sql_used or "")
-    join_gt = _join_count(gt_sql or "")
+    pred_sql_norm = _normalize_sql_for_scoring(pred_sql_used or "") if pred_sql_used else ""
+    join_pred = _join_count(pred_sql_norm)
+    join_gt = _join_count(_normalize_sql_for_scoring(gt_sql or ""))
+    sql_len = len(pred_sql_norm) if pred_sql_norm else 0
+
+    pred_tables = _extract_tables(pred_sql_used or "")
+    gold_tables = _extract_tables(gt_sql or "")
+    pred_cols = _extract_dot_columns(pred_sql_used or "")
+    gold_cols = _extract_dot_columns(gt_sql or "")
+    table_recall = _recall(pred_tables, gold_tables)
+    column_recall = _recall(pred_cols, gold_cols)
 
     detail: dict[str, Any] = {
         "join_pred": join_pred,
         "join_gt": join_gt,
+        "sql_len": sql_len,
+        "table_recall": table_recall,
+        "column_recall": column_recall,
+        "pred_table_count": len(pred_tables),
+        "gt_table_count": len(gold_tables),
+        "pred_column_count": len(pred_cols),
+        "gt_column_count": len(gold_cols),
         "trace_steps": trace_steps,
         "max_compare_rows": max_compare_rows,
         "weight_exec": weight_exec,
@@ -379,14 +440,40 @@ def compute_reward(
             r_trace += 0.25
 
     if answered and sql_ok_count == 0:
-        r_trace -= 0.25
+        # Answering without any successful SQL execution is strongly discouraged for Text2SQL.
+        r_trace -= 0.50
 
     r_trace += -0.15 * min(3, invalid_count)
     r_trace += -0.05 * min(6, max(0, sql_calls - 1))
+    r_trace += -0.03 * min(6, sql_fail_count)
     r_trace += -0.10 * min(3, hallucination_err_count)
     r_trace += -0.20 * min(1, illegal_sql_count)
     r_trace += -0.05 * min(6, extra_steps)
     r_trace += -0.10 if (r_exec < 0 and join_pred > join_gt) else 0.0
+
+    # Tie-breaker among correct trajectories: prefer shorter, simpler SQL.
+    # Keep this small so it doesn't change the main objective (execution correctness).
+    tiebreak_correct = 0.0
+    if r_exec > 0 and pred_sql_norm:
+        tiebreak_correct += -0.0001 * min(2000, sql_len)
+        tiebreak_correct += -0.02 * min(6, join_pred)
+    r_trace += tiebreak_correct
+
+    # Wrong-internal shaping: stable ranking signal for "all-wrong" groups.
+    overlap_bonus = 0.0
+    if r_exec < 0 and pred_sql_norm:
+        overlap_bonus += 0.05 * table_recall + 0.05 * column_recall
+        # If GT is non-empty, prefer non-empty predictions (tiny signal).
+        try:
+            gt_rows = int(detail.get("gt_rows") or 0)
+            pred_rows = int(detail.get("pred_rows") or 0)
+            pred_ok = bool(detail.get("pred_ok"))
+            gt_ok = bool(detail.get("gt_ok"))
+            if pred_ok and gt_ok and gt_rows > 0:
+                overlap_bonus += 0.02 if pred_rows > 0 else -0.02
+        except Exception:
+            pass
+    r_trace += overlap_bonus
 
     # Clamp to [-1, 1] so weights are meaningful.
     r_trace = max(-1.0, min(1.0, r_trace))
@@ -395,6 +482,8 @@ def compute_reward(
         {
             "r_exec": r_exec,
             "r_trace": r_trace,
+            "tiebreak_correct": tiebreak_correct,
+            "overlap_bonus": overlap_bonus,
             "schema_first": schema_first,
             "invalid_count": invalid_count,
             "sql_calls": sql_calls,
