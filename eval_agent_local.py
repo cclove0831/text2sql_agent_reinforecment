@@ -208,6 +208,7 @@ def run_agent_local(
     last_sql = ""
     last_answer: str | None = None
     last_error: str | None = None
+    schema_calls = 0
 
     for step_idx in range(int(max_steps)):
         model_text = _generate_one_greedy(
@@ -222,6 +223,20 @@ def run_agent_local(
         messages.append({"role": "assistant", "content": model_text})
 
         if action == "schema":
+            schema_calls += 1
+            if schema_calls > 2:
+                invalid_obs = "Observation:\nError: Schema 已经提供过多次。请直接输出 [SQL] 继续完成查询与纠错。"
+                messages.append({"role": "user", "content": invalid_obs})
+                trace.append(
+                    {
+                        "step": step_idx,
+                        "action": "INVALID",
+                        "model": model_text,
+                        "error": invalid_obs,
+                        "invalid_type": "too_many_schema_calls",
+                    }
+                )
+                continue
             schema_text = show_schema(db_path=db_path, schema_path=schema_path)
             obs = _render_observation_schema(schema_text)
             messages.append({"role": "user", "content": obs})
@@ -393,11 +408,13 @@ def main() -> None:
     max_compare_rows = None if int(args.max_compare_rows) < 0 else int(args.max_compare_rows)
 
     total = 0
-    n_valid = 0
+    n_agent_ok = 0
+    n_valid_sql = 0
     n_ex = 0
     n_logic_err = 0
     step_sum = 0
     sql_attempt_sum = 0
+    n_no_sql = 0
 
     for ex in items:
         total += 1
@@ -418,15 +435,18 @@ def main() -> None:
         step_sum += len(trace)
         sql_attempt_sum += sum(1 for t in trace if t.get("action") == "SQL")
 
-        valid = bool(out.get("ok"))
-        if valid:
-            n_valid += 1
+        agent_ok = bool(out.get("ok"))
+        if agent_ok:
+            n_agent_ok += 1
 
         gt_sql = (ex.get("gt_sql") or "").strip()
         pred_sql_last = (out.get("sql") or "").strip()
+        if not pred_sql_last.strip():
+            n_no_sql += 1
 
         ex_match = False
         exec_detail: dict[str, Any] | None = None
+        valid_sql = False
         if gt_sql:
             _, exec_detail = compute_reward(
                 pred_sql=pred_sql_last,
@@ -435,14 +455,17 @@ def main() -> None:
                 trace=trace,
                 max_compare_rows=max_compare_rows,
             )
+            valid_sql = bool(exec_detail.get("pred_ok")) if exec_detail else False
+            if valid_sql:
+                n_valid_sql += 1
             ex_match = bool(exec_detail.get("execution_match")) if exec_detail else False
 
         if ex_match:
             n_ex += 1
-        elif valid:
+        elif valid_sql:
             n_logic_err += 1
 
-        if (not valid) or (valid and not ex_match):
+        if (not agent_ok) or (agent_ok and not ex_match):
             pred_sql_used = exec_detail.get("pred_sql_used") if isinstance(exec_detail, dict) else None
             pred_sql_source = exec_detail.get("pred_sql_source") if isinstance(exec_detail, dict) else None
             bad = {
@@ -468,13 +491,16 @@ def main() -> None:
 
         if int(args.print_every) > 0 and (total % int(args.print_every) == 0):
             print(
-                f"[{total}/{len(items)}] EX={n_ex/total:.3f} valid={n_valid/total:.3f} logic_err={n_logic_err/total:.3f}"
+                f"[{total}/{len(items)}] EX={n_ex/total:.3f} valid_sql={n_valid_sql/total:.3f} "
+                f"agent_ok={n_agent_ok/total:.3f} logic_err={n_logic_err/total:.3f}"
             )
 
     bad_f.close()
 
     ex_rate = n_ex / total if total else 0.0
-    valid_rate = n_valid / total if total else 0.0
+    valid_sql_rate = n_valid_sql / total if total else 0.0
+    agent_ok_rate = n_agent_ok / total if total else 0.0
+    no_sql_rate = n_no_sql / total if total else 0.0
     logic_err_rate = n_logic_err / total if total else 0.0
     avg_steps = step_sum / total if total else 0.0
     avg_sql_attempts = sql_attempt_sum / total if total else 0.0
@@ -483,7 +509,9 @@ def main() -> None:
     print(f"Data: {data_path}")
     print(f"Total: {total}")
     print(f"Execution Accuracy (EX): {n_ex}/{total} = {ex_rate:.4f}")
-    print(f"Valid SQL Rate: {n_valid}/{total} = {valid_rate:.4f}")
+    print(f"Valid SQL Rate: {n_valid_sql}/{total} = {valid_sql_rate:.4f}")
+    print(f"Agent OK Rate: {n_agent_ok}/{total} = {agent_ok_rate:.4f}")
+    print(f"No SQL Rate: {n_no_sql}/{total} = {no_sql_rate:.4f}")
     print(f"Logic Error Rate: {n_logic_err}/{total} = {logic_err_rate:.4f}")
     print(f"Avg Steps: {avg_steps:.2f}")
     print(f"Avg SQL Attempts: {avg_sql_attempts:.2f}")

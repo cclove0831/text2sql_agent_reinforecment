@@ -181,6 +181,7 @@ class Text2SQLAgent:
         last_sql = ""
         last_error: str | None = None
         last_answer: str | None = None
+        schema_calls = 0
 
         for step_idx in range(max_steps):
             model_text = self._chat(messages, temperature=temperature, max_tokens=256)
@@ -189,6 +190,20 @@ class Text2SQLAgent:
             messages.append({"role": "assistant", "content": model_text})
 
             if action == "schema":
+                schema_calls += 1
+                if schema_calls > 2:
+                    invalid_obs = "Observation:\nError: Schema 已经提供过多次。请直接输出 [SQL] 继续完成查询与纠错。"
+                    messages.append({"role": "user", "content": invalid_obs})
+                    trace.append(
+                        {
+                            "step": step_idx,
+                            "action": "INVALID",
+                            "model": model_text,
+                            "error": invalid_obs,
+                            "invalid_type": "too_many_schema_calls",
+                        }
+                    )
+                    continue
                 schema_text = show_schema(db_path=db_path, schema_path=schema_path)
                 obs = _render_observation_schema(schema_text)
                 messages.append({"role": "user", "content": obs})

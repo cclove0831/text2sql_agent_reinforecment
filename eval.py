@@ -62,11 +62,13 @@ def main():
     )
 
     total = 0
-    n_valid = 0
+    n_agent_ok = 0
+    n_valid_sql = 0
     n_ex = 0
     n_logic_err = 0
     step_sum = 0
     sql_attempt_sum = 0
+    n_no_sql = 0
 
     for ex in data:
         total += 1
@@ -82,22 +84,30 @@ def main():
         step_sum += len(trace)
         sql_attempt_sum += sum(1 for t in trace if t.get("action") == "SQL")
 
-        valid = bool(out.get("ok"))
-        if valid:
-            n_valid += 1
+        agent_ok = bool(out.get("ok"))
+        if agent_ok:
+            n_agent_ok += 1
 
         ex_match = False
         ex_detail: dict | None = None
-        if valid and out.get("sql"):
+        pred_sql = out.get("sql") or ""
+        if not str(pred_sql).strip():
+            n_no_sql += 1
+
+        valid_sql = False
+        if str(pred_sql).strip():
             ex_match, ex_detail = execution_match(
-                out["sql"], ex.get("gt_sql") or "", db_path=ex.get("db_path"), max_rows=max_compare_rows
+                pred_sql, ex.get("gt_sql") or "", db_path=ex.get("db_path"), max_rows=max_compare_rows
             )
+            valid_sql = bool((ex_detail or {}).get("pred_ok"))
+            if valid_sql:
+                n_valid_sql += 1
             if ex_match:
                 n_ex += 1
-            else:
+            elif valid_sql:
                 n_logic_err += 1
 
-        if (not valid) or (valid and not ex_match):
+        if (not agent_ok) or (agent_ok and not ex_match):
             bad = {
                 "id": ex.get("id"),
                 "db_id": ex.get("db_id"),
@@ -119,13 +129,16 @@ def main():
 
         if args.print_every > 0 and (total % args.print_every == 0):
             print(
-                f"[{total}/{len(data)}] EX={n_ex/total:.3f} valid={n_valid/total:.3f} logic_err={n_logic_err/total:.3f}"
+                f"[{total}/{len(data)}] EX={n_ex/total:.3f} valid_sql={n_valid_sql/total:.3f} "
+                f"agent_ok={n_agent_ok/total:.3f} logic_err={n_logic_err/total:.3f}"
             )
 
     badcase_f.close()
 
     ex_rate = n_ex / total if total else 0.0
-    valid_rate = n_valid / total if total else 0.0
+    valid_sql_rate = n_valid_sql / total if total else 0.0
+    agent_ok_rate = n_agent_ok / total if total else 0.0
+    no_sql_rate = n_no_sql / total if total else 0.0
     logic_err_rate = n_logic_err / total if total else 0.0
     avg_steps = step_sum / total if total else 0.0
     avg_sql_attempts = sql_attempt_sum / total if total else 0.0
@@ -134,7 +147,9 @@ def main():
     print(f"Data: {data_path}")
     print(f"Total: {total}")
     print(f"Execution Accuracy (EX): {n_ex}/{total} = {ex_rate:.4f}")
-    print(f"Valid SQL Rate: {n_valid}/{total} = {valid_rate:.4f}")
+    print(f"Valid SQL Rate: {n_valid_sql}/{total} = {valid_sql_rate:.4f}")
+    print(f"Agent OK Rate: {n_agent_ok}/{total} = {agent_ok_rate:.4f}")
+    print(f"No SQL Rate: {n_no_sql}/{total} = {no_sql_rate:.4f}")
     print(f"Logic Error Rate: {n_logic_err}/{total} = {logic_err_rate:.4f}")
     print(f"Avg Steps: {avg_steps:.2f}")
     print(f"Avg SQL Attempts: {avg_sql_attempts:.2f}")
@@ -143,4 +158,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

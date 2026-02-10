@@ -225,6 +225,7 @@ def rollout_trajectory(
     last_sql = ""
     last_answer: str | None = None
     last_error: str | None = None
+    schema_calls = 0
 
     for step_idx in range(int(max_steps)):
         prompt_snapshot = [dict(m) for m in messages]
@@ -242,6 +243,24 @@ def rollout_trajectory(
         messages.append({"role": "assistant", "content": model_text})
 
         if action == "schema":
+            schema_calls += 1
+            if schema_calls > 2:
+                invalid_obs = (
+                    "Observation:\nError: Schema 已经提供过多次。请直接输出 [SQL] 继续完成查询与纠错。"
+                )
+                messages.append({"role": "user", "content": invalid_obs})
+                trace.append(
+                    {
+                        "step": step_idx,
+                        "action": "INVALID",
+                        "model": model_text,
+                        "token_ids": token_ids,
+                        "prompt_messages": prompt_snapshot,
+                        "error": invalid_obs,
+                        "invalid_type": "too_many_schema_calls",
+                    }
+                )
+                continue
             schema_text = show_schema(db_path=db_path, schema_path=schema_path)
             obs = _render_observation_schema(schema_text)
             messages.append({"role": "user", "content": obs})
@@ -455,12 +474,12 @@ def parse_args() -> argparse.Namespace:
         "--skip_update_std",
         type=float,
         default=1e-3,
-        help="Skip policy update when reward std < this threshold (and kl_beta==0).",
+        help="Skip policy update when reward std < this threshold (low-information group).",
     )
     parser.add_argument(
         "--no_ex_update",
         type=str,
-        default="kl_only",
+        default="skip",
         choices=["update", "skip", "scale", "kl_only"],
         help="What to do when a group has ex@group==0 (no execution-correct samples). "
         "'skip' skips the update; 'kl_only' zeroes the policy-gradient term but keeps KL (if enabled); "
@@ -784,6 +803,10 @@ def main() -> None:
             ex_rate = sum(1 for s in samples if (s.get("reward_detail") or {}).get("execution_match")) / float(
                 max(1, len(samples))
             )
+            no_sql_rate = sum(1 for s in samples if int((s.get("reward_detail") or {}).get("sql_calls") or 0) == 0) / float(
+                max(1, len(samples))
+            )
+            deterministic_prefix = _is_deterministic_prefix(samples)
             adv_weight = 1.0
             skip_reason = ""
 
@@ -799,7 +822,7 @@ def main() -> None:
                     skip_reason = f"no_ex_scale={adv_weight:g}"
 
             skipped_update = False
-            if float(args.kl_beta) == 0.0 and float(std_r.item()) < skip_update_std:
+            if float(std_r.item()) < skip_update_std:
                 skipped_update = True
                 skip_reason = "low_std"
             elif skip_reason == "no_ex":
@@ -808,7 +831,11 @@ def main() -> None:
                 # "kl_only" degenerates to a no-op update when KL is disabled.
                 skipped_update = True
                 skip_reason = "no_ex"
-            deterministic_prefix = _is_deterministic_prefix(samples)
+            elif ex_rate <= 0.0 and deterministic_prefix and no_sql_rate >= 0.90:
+                # Collapse guard: all trajectories are near-identical and none is correct.
+                # Updating on this group usually reinforces a bad local attractor.
+                skipped_update = True
+                skip_reason = "collapse_guard"
             if bool(args.debug_tie_groups) and debug_tie_left > 0 and deterministic_prefix and skipped_update:
                 sqls = [((s.get("reward_detail") or {}).get("pred_sql_used") or "").strip() for s in samples]
                 hashes = [
@@ -841,7 +868,8 @@ def main() -> None:
                             with torch.no_grad():
                                 ref_lp_sum, ref_n = policy_logprob_sum(ref_model, tokenizer, traj["trace"], device=device)
                                 ref_lp = ref_lp_sum / float(max(1, int(ref_n)))
-                            kl_term = lp - ref_lp
+                            log_ratio = lp - ref_lp
+                            kl_term = log_ratio * log_ratio
                         elif ref_adapter is not None:
                             with torch.no_grad():
                                 prev_adapter = policy_adapter or _active_adapter_name(model)
@@ -856,7 +884,8 @@ def main() -> None:
                                         _set_active_adapter(model, prev_adapter)
                                     if prev_training:
                                         model.train()
-                            kl_term = lp - ref_lp
+                            log_ratio = lp - ref_lp
+                            kl_term = log_ratio * log_ratio
                         kl_sum = kl_sum + kl_term.detach()
                         kl_n += 1
 
@@ -891,11 +920,18 @@ def main() -> None:
 
             if int(args.log_every) > 0 and group_idx % int(args.log_every) == 0:
                 avg_steps = sum(len(s.get("trace") or []) for s in samples) / float(max(1, len(samples)))
+                avg_sql_calls = sum(int((s.get("reward_detail") or {}).get("sql_calls") or 0) for s in samples) / float(
+                    max(1, len(samples))
+                )
+                avg_schema_calls = sum(
+                    int((s.get("reward_detail") or {}).get("schema_calls") or 0) for s in samples
+                ) / float(max(1, len(samples)))
                 gs = f" gs={len(samples)}" if adaptive else ""
                 note = f" (skip_update:{skip_reason})" if skipped_update else ""
                 print(
                     f"[epoch={epoch+1} group={group_idx}/{len(items)} step={step}] "
-                    f"meanR={mean_r.item():.4f} stdR={std_r.item():.4f} ex@group={ex_rate:.3f} avg_steps={avg_steps:.2f}{gs}{note}"
+                    f"meanR={mean_r.item():.4f} stdR={std_r.item():.4f} ex@group={ex_rate:.3f} "
+                    f"avg_steps={avg_steps:.2f} avg_sql={avg_sql_calls:.2f} no_sql={no_sql_rate:.2f}{gs}{note}"
                 )
                 if tb_writer is not None:
                     x = int(group_idx)
@@ -904,6 +940,9 @@ def main() -> None:
                         tb_writer.add_scalar("train/std_reward", float(std_r.item()), x)
                         tb_writer.add_scalar("train/ex_rate", float(ex_rate), x)
                         tb_writer.add_scalar("train/avg_steps", float(avg_steps), x)
+                        tb_writer.add_scalar("train/avg_sql_calls", float(avg_sql_calls), x)
+                        tb_writer.add_scalar("train/avg_schema_calls", float(avg_schema_calls), x)
+                        tb_writer.add_scalar("train/no_sql_rate", float(no_sql_rate), x)
                         tb_writer.add_scalar("train/group_size_effective", float(len(samples)), x)
                         tb_writer.add_scalar("train/skip_update", 1.0 if skipped_update else 0.0, x)
                         tb_writer.add_scalar("train/adv_weight", float(adv_weight), x)

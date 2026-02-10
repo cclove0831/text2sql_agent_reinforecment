@@ -389,6 +389,7 @@ def compute_reward(
     # ---- r_trace (shaping) ----
     # Keep shaping in [-1, 1] and smaller than the hard reward.
     schema_first = None
+    schema_calls = 0
     invalid_count = 0
     early_answer_count = 0
     sql_calls = 0
@@ -396,12 +397,16 @@ def compute_reward(
     sql_fail_count = 0
     hallucination_err_count = 0
     illegal_sql_count = 0
+    repeated_sql_count = 0
     answered = False
+    prev_sql_norm: str | None = None
 
     if trace:
         schema_first = bool(trace and trace[0].get("action") == "SCHEMA")
         for step in trace:
             act = step.get("action")
+            if act == "SCHEMA":
+                schema_calls += 1
             if act == "INVALID":
                 invalid_count += 1
                 if (step.get("invalid_type") or "") == "answer_before_sql_ok":
@@ -410,6 +415,11 @@ def compute_reward(
             if act == "SQL":
                 sql_calls += 1
                 sql_text = step.get("sql") or ""
+                sql_norm = _normalize_sql_for_scoring(sql_text)
+                if prev_sql_norm is not None and sql_norm and sql_norm == prev_sql_norm:
+                    repeated_sql_count += 1
+                if sql_norm:
+                    prev_sql_norm = sql_norm
                 if _DISALLOWED_SQL.search(sql_text):
                     illegal_sql_count += 1
                 ok = bool(step.get("ok"))
@@ -442,6 +452,15 @@ def compute_reward(
         elif r_exec > 0:
             r_trace += 0.25
 
+    if trace is not None and sql_calls == 0:
+        # Degenerate behavior: repeatedly asking for schema without ever attempting a query.
+        # This is worse than at least trying a SQL and getting an error.
+        r_trace -= 0.75
+
+    if trace is not None and schema_calls > 1:
+        # Re-reading schema too many times usually indicates a stuck policy.
+        r_trace += -0.10 * min(5, schema_calls - 1)
+
     if answered and sql_ok_count == 0:
         # Answering without any successful SQL execution is strongly discouraged for Text2SQL.
         r_trace -= 0.50
@@ -450,6 +469,7 @@ def compute_reward(
     r_trace += -0.50 * min(2, early_answer_count)
     r_trace += -0.05 * min(6, max(0, sql_calls - 1))
     r_trace += -0.03 * min(6, sql_fail_count)
+    r_trace += -0.05 * min(4, repeated_sql_count)
     r_trace += -0.10 * min(3, hallucination_err_count)
     r_trace += -0.20 * min(1, illegal_sql_count)
     r_trace += -0.05 * min(6, extra_steps)
@@ -489,11 +509,13 @@ def compute_reward(
             "tiebreak_correct": tiebreak_correct,
             "overlap_bonus": overlap_bonus,
             "schema_first": schema_first,
+            "schema_calls": schema_calls,
             "invalid_count": invalid_count,
             "early_answer_count": early_answer_count,
             "sql_calls": sql_calls,
             "sql_ok_count": sql_ok_count,
             "sql_fail_count": sql_fail_count,
+            "repeated_sql_count": repeated_sql_count,
             "hallucination_err_count": hallucination_err_count,
             "illegal_sql_count": illegal_sql_count,
             "minimal_steps": minimal_steps,
