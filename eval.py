@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 
 from agent_llm import Text2SQLAgent
-from reward import execution_match
+from reward import compute_reward
 
 
 def load_jsonl(path: Path) -> list[dict]:
@@ -88,26 +88,35 @@ def main():
         if agent_ok:
             n_agent_ok += 1
 
-        ex_match = False
-        ex_detail: dict | None = None
-        pred_sql = out.get("sql") or ""
-        if not str(pred_sql).strip():
+        trace = out.get("trace") or []
+        pred_sql_last = out.get("sql") or ""
+        gt_sql = ex.get("gt_sql") or ""
+
+        # Use reward.compute_reward to select pred_sql_used from trace (last ok SQL) to avoid
+        # undercounting EX when the last attempted SQL failed but an earlier SQL succeeded.
+        _, ex_detail = compute_reward(
+            pred_sql=pred_sql_last,
+            gt_sql=gt_sql,
+            db_path=ex.get("db_path"),
+            trace=trace,
+            max_compare_rows=max_compare_rows,
+            weight_exec=1.0,
+            weight_trace=0.0,
+        )
+        ex_match = bool(ex_detail.get("execution_match"))
+        valid_sql = bool(ex_detail.get("pred_ok"))
+        if valid_sql:
+            n_valid_sql += 1
+        if ex_match:
+            n_ex += 1
+        elif valid_sql:
+            n_logic_err += 1
+        if int(ex_detail.get("sql_calls") or 0) == 0:
             n_no_sql += 1
 
-        valid_sql = False
-        if str(pred_sql).strip():
-            ex_match, ex_detail = execution_match(
-                pred_sql, ex.get("gt_sql") or "", db_path=ex.get("db_path"), max_rows=max_compare_rows
-            )
-            valid_sql = bool((ex_detail or {}).get("pred_ok"))
-            if valid_sql:
-                n_valid_sql += 1
-            if ex_match:
-                n_ex += 1
-            elif valid_sql:
-                n_logic_err += 1
-
         if (not agent_ok) or (agent_ok and not ex_match):
+            pred_sql_used = ex_detail.get("pred_sql_used")
+            pred_sql_source = ex_detail.get("pred_sql_source")
             bad = {
                 "id": ex.get("id"),
                 "db_id": ex.get("db_id"),
@@ -115,8 +124,10 @@ def main():
                 "schema_path": ex.get("schema_path"),
                 "question": ex.get("question"),
                 "gt_sql": ex.get("gt_sql"),
-                "pred_sql": out.get("sql"),
-                "pred_ok": out.get("ok"),
+                "pred_sql_last": pred_sql_last,
+                "pred_sql_used": pred_sql_used,
+                "pred_sql_source": pred_sql_source,
+                "agent_ok": out.get("ok"),
                 "pred_error": out.get("error"),
                 "pred_answer": out.get("answer"),
                 "steps": len(trace),
